@@ -1,0 +1,84 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.optimize import minimize
+from scipy.special import gammaln
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# 1) Download daily data (auto-adjusted)
+# ----------------------------
+tickers = ["GLD", "SLV"]
+raw = yf.download(
+    tickers,
+    start="2005-01-01",
+    auto_adjust=True,     # makes Close already adjusted
+    progress=False,
+    group_by="column"
+)
+
+# With auto_adjust=True, use "Close" (Adj Close may not exist)
+if isinstance(raw.columns, pd.MultiIndex):
+    prices = raw["Close"].dropna()
+else:
+    # Single ticker fallback
+    prices = raw[["Close"]].rename(columns={"Close": tickers[0]}).dropna()
+
+# sanity
+assert prices.shape[1] == len(tickers), f"Unexpected columns: {prices.columns}"
+
+rets = np.log(prices).diff().dropna()
+
+# ----------------------------
+# 2) q-Gaussian log-likelihood
+# ----------------------------
+def log_Zq(q, beta):
+    # log Z_q for q in (1,3)
+    a = (3.0 - q) / (2.0 * (q - 1.0))
+    b = 1.0 / (q - 1.0)
+    return 0.5*np.log(np.pi) + gammaln(a) - 0.5*np.log(beta*(q-1.0)) - gammaln(b)
+
+def neg_loglik(params, x):
+    q, beta = params
+    if not (1.0001 < q < 2.9999 and beta > 1e-12):
+        return 1e12
+    logZ = log_Zq(q, beta)
+    term = 1.0 + (q-1.0)*beta*(x**2)
+    ll = -logZ - (1.0/(q-1.0))*np.log(term)
+    return -np.sum(ll)
+
+def fit_q_gaussian(x):
+    x = np.asarray(x)
+    x = (x - x.mean()) / (x.std() + 1e-12)  # standardize
+    x0 = np.array([1.25, 1.0])
+    bounds = [(1.0001, 2.9999), (1e-6, 100.0)]
+    res = minimize(neg_loglik, x0, args=(x,), method="L-BFGS-B", bounds=bounds)
+    return res.x[0], res.x[1]
+
+# ----------------------------
+# 3) Rolling estimation
+# ----------------------------
+W = 252  # 1-year window
+dates = rets.index[W:]
+roll_q = {t: [] for t in tickers}
+
+for i in range(W, len(rets)):
+    window = rets.iloc[i-W:i]
+    for t in tickers:
+        q_hat, _ = fit_q_gaussian(window[t].values)
+        roll_q[t].append(q_hat)
+
+roll_q_df = pd.DataFrame(roll_q, index=dates)
+
+# ----------------------------
+# 4) Save + plot
+# ----------------------------
+roll_q_df.to_csv("rolling_q_GLD_SLV.csv")
+
+ax = roll_q_df.plot(figsize=(10,4), title="Rolling q-index (q-Gaussian MLE), daily GLD/SLV")
+ax.set_ylabel("Estimated q")
+plt.tight_layout()
+plt.savefig("rolling_q_GLD_SLV.png", dpi=300)
+
+print("Saved: rolling_q_GLD_SLV.csv and rolling_q_GLD_SLV.png")
+roll_q_df.tail()
