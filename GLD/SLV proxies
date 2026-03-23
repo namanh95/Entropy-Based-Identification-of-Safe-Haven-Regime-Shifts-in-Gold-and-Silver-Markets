@@ -179,3 +179,38 @@ print("- q_threshold_summary_GLD.csv")
 print("- q_threshold_summary_SLV.csv")
 print("- entropy_tailcorr_merged.csv")
 print("- q_threshold_tailcorr_GLD_SLV_SPY.png")
+from scipy.stats import ttest_ind, spearmanr
+
+# ----------------------------
+# 9) Statistical tests
+# ----------------------------
+
+def run_tests(df, asset, q_star=1.5):
+    qcol = f"q_{asset}"
+    rcol = f"rhoL_{asset}"
+
+    tmp = df[[qcol, rcol]].dropna()
+
+    low = tmp[tmp[qcol] <= q_star][rcol]
+    high = tmp[tmp[qcol] > q_star][rcol]
+
+    # Welch t-test (unequal variance)
+    t_stat, p_val = ttest_ind(high, low, equal_var=False, alternative='greater')
+
+    # Spearman rank correlation
+    rho_s, p_s = spearmanr(tmp[qcol], tmp[rcol])
+
+    return {
+        "mean_low_q": low.mean(),
+        "mean_high_q": high.mean(),
+        "t_stat": t_stat,
+        "p_value_ttest": p_val,
+        "spearman_corr": rho_s,
+        "p_value_spearman": p_s
+    }
+
+test_gld = run_tests(results, "GLD", q_star=1.5)
+test_slv = run_tests(results, "SLV", q_star=1.3)
+
+print("GLD test:", test_gld)
+print("SLV test:", test_slv)
