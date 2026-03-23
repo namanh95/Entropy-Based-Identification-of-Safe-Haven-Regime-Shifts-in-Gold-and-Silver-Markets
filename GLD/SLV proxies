@@ -469,3 +469,53 @@ lead_slv = compute_lead_lag_events(results, "SLV", q_star=1.3)
 print("Lead-lag (days):")
 print("GLD:", lead_gld)
 print("SLV:", lead_slv)
+# ----------------------------
+# 11) Simple portfolio test (robust version)
+# ----------------------------
+
+# Remove duplicate columns
+aligned = aligned.loc[:, ~aligned.columns.duplicated()].copy()
+
+# Keep only common dates
+common_idx = results.index.intersection(aligned.index)
+results_sub = results.loc[common_idx].copy()
+aligned_sub = aligned.loc[common_idx].copy()
+
+w0 = 0.5
+gamma = 0.3
+
+portfolio_static = []
+portfolio_entropy = []
+
+for t in common_idx:
+    r_m = aligned_sub.loc[t, "SPY"]
+    r_g = aligned_sub.loc[t, "GLD"]
+    q_val = results_sub.loc[t, "q_GLD"]
+
+    if isinstance(r_m, pd.Series):
+        r_m = r_m.iloc[0]
+    if isinstance(r_g, pd.Series):
+        r_g = r_g.iloc[0]
+    if isinstance(q_val, pd.Series):
+        q_val = q_val.iloc[0]
+
+    r_m = float(r_m)
+    r_g = float(r_g)
+    q_val = float(q_val)
+
+    r_static = w0 * r_g + (1.0 - w0) * r_m
+    w = gamma * w0 if q_val > 1.5 else w0
+    r_dyn = w * r_g + (1.0 - w) * r_m
+
+    portfolio_static.append(r_static)
+    portfolio_entropy.append(r_dyn)
+
+portfolio_df = pd.DataFrame(
+    {"static": portfolio_static, "entropy": portfolio_entropy},
+    index=common_idx
+)
+
+cum = (1.0 + portfolio_df).cumprod()
+
+print("Final returns:")
+print(cum.tail(1))
