@@ -6,25 +6,22 @@ from scipy.special import gammaln
 import matplotlib.pyplot as plt
 
 # ----------------------------
-# 1) Download daily data (auto-adjusted)
+# 1) Download daily data
 # ----------------------------
-tickers = ["GLD", "SLV"]
+tickers = ["GLD", "SLV", "SPY"]
 raw = yf.download(
     tickers,
     start="2005-01-01",
-    auto_adjust=True,     # makes Close already adjusted
+    auto_adjust=True,
     progress=False,
     group_by="column"
 )
 
-# With auto_adjust=True, use "Close" (Adj Close may not exist)
 if isinstance(raw.columns, pd.MultiIndex):
     prices = raw["Close"].dropna()
 else:
-    # Single ticker fallback
     prices = raw[["Close"]].rename(columns={"Close": tickers[0]}).dropna()
 
-# sanity
 assert prices.shape[1] == len(tickers), f"Unexpected columns: {prices.columns}"
 
 rets = np.log(prices).diff().dropna()
@@ -33,52 +30,152 @@ rets = np.log(prices).diff().dropna()
 # 2) q-Gaussian log-likelihood
 # ----------------------------
 def log_Zq(q, beta):
-    # log Z_q for q in (1,3)
     a = (3.0 - q) / (2.0 * (q - 1.0))
     b = 1.0 / (q - 1.0)
-    return 0.5*np.log(np.pi) + gammaln(a) - 0.5*np.log(beta*(q-1.0)) - gammaln(b)
+    return 0.5 * np.log(np.pi) + gammaln(a) - 0.5 * np.log(beta * (q - 1.0)) - gammaln(b)
 
 def neg_loglik(params, x):
     q, beta = params
     if not (1.0001 < q < 2.9999 and beta > 1e-12):
         return 1e12
     logZ = log_Zq(q, beta)
-    term = 1.0 + (q-1.0)*beta*(x**2)
-    ll = -logZ - (1.0/(q-1.0))*np.log(term)
+    term = 1.0 + (q - 1.0) * beta * (x ** 2)
+    ll = -logZ - (1.0 / (q - 1.0)) * np.log(term)
     return -np.sum(ll)
 
 def fit_q_gaussian(x):
     x = np.asarray(x)
-    x = (x - x.mean()) / (x.std() + 1e-12)  # standardize
+    x = (x - x.mean()) / (x.std() + 1e-12)
     x0 = np.array([1.25, 1.0])
     bounds = [(1.0001, 2.9999), (1e-6, 100.0)]
     res = minimize(neg_loglik, x0, args=(x,), method="L-BFGS-B", bounds=bounds)
     return res.x[0], res.x[1]
 
 # ----------------------------
-# 3) Rolling estimation
+# 3) Rolling q estimation
 # ----------------------------
-W = 252  # 1-year window
+W = 252
 dates = rets.index[W:]
-roll_q = {t: [] for t in tickers}
+roll_q = {"GLD": [], "SLV": []}
 
 for i in range(W, len(rets)):
-    window = rets.iloc[i-W:i]
-    for t in tickers:
+    window = rets.iloc[i - W:i]
+    for t in ["GLD", "SLV"]:
         q_hat, _ = fit_q_gaussian(window[t].values)
         roll_q[t].append(q_hat)
 
 roll_q_df = pd.DataFrame(roll_q, index=dates)
 
 # ----------------------------
-# 4) Save + plot
+# 4) Rolling lower-tail correlation with SPY
+# ----------------------------
+def lower_tail_corr(x, y, quantile=0.05):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    thresh = np.quantile(y, quantile)   # lower tail of market return
+    mask = y <= thresh
+    if mask.sum() < 10:
+        return np.nan
+    xs = x[mask]
+    ys = y[mask]
+    if np.std(xs) < 1e-12 or np.std(ys) < 1e-12:
+        return np.nan
+    return np.corrcoef(xs, ys)[0, 1]
+
+roll_tailcorr = {"GLD": [], "SLV": []}
+
+for i in range(W, len(rets)):
+    window = rets.iloc[i - W:i]
+    spy_w = window["SPY"].values
+    for t in ["GLD", "SLV"]:
+        asset_w = window[t].values
+        rho_L = lower_tail_corr(asset_w, spy_w, quantile=0.05)
+        roll_tailcorr[t].append(rho_L)
+
+roll_tailcorr_df = pd.DataFrame(roll_tailcorr, index=dates)
+
+# ----------------------------
+# 5) Merge q and tail-correlation
+# ----------------------------
+results = pd.concat(
+    [
+        roll_q_df.add_prefix("q_"),
+        roll_tailcorr_df.add_prefix("rhoL_")
+    ],
+    axis=1
+).dropna()
+
+# ----------------------------
+# 6) Estimate empirical q* by entropy regime
+# ----------------------------
+bins = [1.0, 1.2, 1.3, 1.4, 1.5, 3.0]
+labels = ["(1.0,1.2]", "(1.2,1.3]", "(1.3,1.4]", "(1.4,1.5]", "(1.5,3.0]"]
+
+def regime_summary(df, asset):
+    qcol = f"q_{asset}"
+    rcol = f"rhoL_{asset}"
+    tmp = df[[qcol, rcol]].dropna().copy()
+    tmp["q_regime"] = pd.cut(tmp[qcol], bins=bins, labels=labels)
+    summary = tmp.groupby("q_regime", observed=True)[rcol].agg(["mean", "count", "std"])
+    summary = summary.rename(columns={
+        "mean": "avg_lower_tail_corr",
+        "count": "n_obs",
+        "std": "std_lower_tail_corr"
+    })
+    return summary
+
+summary_gld = regime_summary(results, "GLD")
+summary_slv = regime_summary(results, "SLV")
+
+def estimate_q_star(summary):
+    for label in summary.index:
+        if summary.loc[label, "avg_lower_tail_corr"] > 0:
+            return label
+    return "No positive-threshold regime detected"
+
+qstar_gld = estimate_q_star(summary_gld)
+qstar_slv = estimate_q_star(summary_slv)
+
+print("Estimated q* regime for GLD:", qstar_gld)
+print("Estimated q* regime for SLV:", qstar_slv)
+
+# ----------------------------
+# 7) Save outputs
 # ----------------------------
 roll_q_df.to_csv("rolling_q_GLD_SLV.csv")
+roll_tailcorr_df.to_csv("rolling_lower_tail_corr_GLD_SLV_vs_SPY.csv")
+summary_gld.to_csv("q_threshold_summary_GLD.csv")
+summary_slv.to_csv("q_threshold_summary_SLV.csv")
+results.to_csv("entropy_tailcorr_merged.csv")
 
-ax = roll_q_df.plot(figsize=(10,4), title="Rolling q-index (q-Gaussian MLE), daily GLD/SLV")
-ax.set_ylabel("Estimated q")
+# ----------------------------
+# 8) Plot: q_t and lower-tail correlation
+# ----------------------------
+fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+axes[0].plot(results.index, results["q_GLD"], label="GLD q_t")
+axes[0].plot(results.index, results["q_SLV"], label="SLV q_t")
+axes[0].axhline(1.3, linestyle="--", linewidth=1, label="Warning threshold")
+axes[0].axhline(1.5, linestyle="--", linewidth=1, label="Critical threshold")
+axes[0].set_ylabel("Estimated q")
+axes[0].set_title("Rolling entropic index (q-Gaussian MLE)")
+axes[0].legend()
+
+axes[1].plot(results.index, results["rhoL_GLD"], label="GLD vs SPY lower-tail corr")
+axes[1].plot(results.index, results["rhoL_SLV"], label="SLV vs SPY lower-tail corr")
+axes[1].axhline(0.0, linestyle="--", linewidth=1, label="Zero correlation")
+axes[1].set_ylabel("Lower-tail correlation")
+axes[1].set_title("Rolling lower-tail correlation with SPY")
+axes[1].legend()
+
 plt.tight_layout()
-plt.savefig("rolling_q_GLD_SLV.png", dpi=300)
+plt.savefig("q_threshold_tailcorr_GLD_SLV_SPY.png", dpi=300)
+plt.show()
 
-print("Saved: rolling_q_GLD_SLV.csv and rolling_q_GLD_SLV.png")
-roll_q_df.tail()
+print("Saved:")
+print("- rolling_q_GLD_SLV.csv")
+print("- rolling_lower_tail_corr_GLD_SLV_vs_SPY.csv")
+print("- q_threshold_summary_GLD.csv")
+print("- q_threshold_summary_SLV.csv")
+print("- entropy_tailcorr_merged.csv")
+print("- q_threshold_tailcorr_GLD_SLV_SPY.png")
